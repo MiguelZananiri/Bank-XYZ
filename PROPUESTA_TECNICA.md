@@ -1,134 +1,229 @@
-# Propuesta Técnica - Bank XYZ
+# Propuesta Técnica
+## Implementación Backend for Frontend - Bank XYZ
 
-## 1. Objetivo
+### 1. Contexto
 
-La solución moderniza tres procesos batch legacy del Banco XYZ utilizando Spring Batch:
+El proyecto Bank XYZ requiere atender tres tipos de clientes con necesidades diferentes:
 
-- Reporte de transacciones diarias.
-- Cálculo de intereses mensuales.
-- Generación de estados de cuenta anuales.
+- Aplicación Web.
+- Aplicación Móvil.
+- Cajero Automático (ATM).
 
-El diseño busca mantener la consistencia de los datos, controlar registros incorrectos y mejorar el rendimiento mediante procesamiento paralelo.
+Una única respuesta genérica para los tres canales provocaría transferencia innecesaria de información y aumentaría el acoplamiento entre los clientes y el backend.
 
-## 2. Arquitectura propuesta
+Por esta razón se implementa el patrón arquitectónico **Backend for Frontend (BFF)**.
 
-Cada proceso fue implementado como un Job independiente de Spring Batch y utiliza el flujo:
+---
 
-```text
-Reader → Processor → Writer
-```
+## 2. Estrategia seleccionada
 
-Los archivos CSV son divididos en particiones para permitir su procesamiento concurrente.
+La estrategia seleccionada consiste en implementar un **BFF independiente para cada tipo de cliente**.
 
-La configuración principal utilizada es:
-
-```text
-Chunk size: 5
-Grid size: 5
-Pool size: 3
-```
-
-Los cinco segmentos de datos son distribuidos entre tres workers mediante `TaskExecutorPartitionHandler`.
-
-## 3. Procesamiento y validación
-
-Los `ItemProcessor` realizan las transformaciones y validaciones necesarias antes de persistir la información.
-
-Se controlan, entre otros casos:
-
-- Campos obligatorios faltantes.
-- Fechas con formatos inválidos.
-- Montos inválidos.
-- Tipos de datos no reconocidos.
-- Valores que deben clasificarse como anomalías.
-
-Los datos válidos y las anomalías que pueden ser procesadas son almacenados en Oracle, mientras que los registros que no pueden continuar son omitidos mediante una política controlada.
-
-## 4. Tolerancia a fallos
-
-Los Steps utilizan configuración `faultTolerant`.
-
-La política personalizada `BankSkipPolicy` permite omitir errores de datos conocidos sin detener completamente el Job.
-
-Además, los `SkipListener` registran los elementos descartados y su causa.
-
-Para errores transitorios de acceso a datos se configuró una política de reintento utilizando:
-
-```java
-.retry(TransientDataAccessException.class)
-.retryLimit(2)
-```
-
-En el Job de intereses mensuales también se contempla `DuplicateKeyException`, debido a una condición de concurrencia detectada durante escrituras paralelas sobre una misma clave.
-
-Los errores correspondientes a datos de negocio son gestionados mediante la política de omisión y no mediante reintentos.
-
-## 5. Escalamiento y paralelismo
-
-Se seleccionó partitioning como estrategia de escalamiento.
-
-Para determinar la cantidad adecuada de threads se ejecutó el Job de transacciones diarias con el mismo volumen de 1000 registros, manteniendo constantes el `chunk size` y el número de particiones.
-
-| Threads | Tiempo particiones | Tiempo total Job |
-|---:|---:|---:|
-| 1 | 6,977 s | 7,251 s |
-| 2 | 4,360 s | 4,593 s |
-| 3 | 3,109 s | 3,401 s |
-
-La configuración de tres threads obtuvo el menor tiempo de ejecución.
-
-Respecto a la ejecución con un thread, el tiempo total se redujo aproximadamente un 53 %.
-
-Por este motivo se seleccionó como configuración final:
-
-```properties
-app.poolSize=3
-```
-
-Esta configuración también permite observar la ejecución concurrente mediante:
+La arquitectura queda compuesta por:
 
 ```text
-batch-worker-1
-batch-worker-2
-batch-worker-3
+                       Oracle Database
+                              │
+                              ▼
+                     Backend principal
+                    http://localhost:8080
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+              ▼               ▼               ▼
+          BFF Web         BFF Mobile        BFF ATM
+      https://:8081     https://:8082     https://:8083
+              │               │               │
+              ▼               ▼               ▼
+             Web             Móvil           Cajero
 ```
 
-## 6. Resultados obtenidos
+Cada BFF es una aplicación Spring Boot independiente, con su propia configuración, endpoints, DTO, lógica de transformación y configuración de seguridad.
 
-### Transacciones diarias
+El acceso a Oracle permanece centralizado en el backend principal.
+
+---
+
+## 3. Justificación
+
+Se seleccionó esta estrategia porque cada canal posee requerimientos diferentes.
+
+### Web
+
+El cliente Web dispone de una interfaz con mayor capacidad para mostrar información detallada.
+
+Su BFF entrega:
+
+- Identificación de la cuenta.
+- Datos del cliente.
+- Tipo de cuenta.
+- Saldo inicial.
+- Tasa de interés.
+- Interés calculado.
+- Saldo actual.
+- Estado.
+
+### Mobile
+
+El cliente Mobile busca reducir el volumen de información transferida.
+
+Su respuesta contiene solamente:
+
+- ID de cuenta.
+- Nombre.
+- Tipo de cuenta.
+- Saldo actual.
+- Estado.
+
+Esto permite disminuir el tamaño de la respuesta y evitar enviar información que la interfaz móvil no necesita.
+
+### ATM
+
+El cajero automático requiere una interfaz reducida y orientada a operaciones concretas.
+
+El BFF ATM expone principalmente:
+
+- Consulta de saldo.
+- Retiro de dinero.
+
+De esta manera no se entrega información adicional innecesaria para la operación de un cajero.
+
+---
+
+## 4. Optimización por canal
+
+Las respuestas fueron diseñadas específicamente para las necesidades de cada cliente.
+
+Durante una prueba utilizando la cuenta `101` se obtuvieron los siguientes tamaños:
+
+| Canal | Tamaño |
+|---|---:|
+| Web | 183 bytes |
+| Mobile | 99 bytes |
+| ATM | 57 bytes |
+
+Respecto de Web:
+
+- Mobile transfirió aproximadamente un **45,9 % menos información**.
+- ATM transfirió aproximadamente un **68,9 % menos información**.
+
+También se obtuvieron los siguientes tiempos durante una ejecución de prueba:
+
+| Canal | Tiempo |
+|---|---:|
+| Web | 0.381755 s |
+| Mobile | 0.111764 s |
+| ATM | 0.093577 s |
+
+Los tiempos pueden variar según cada ejecución, por lo que se consideran solamente como referencia.
+
+La principal evidencia de optimización corresponde a la reducción del tamaño de las respuestas mediante DTO específicos por canal.
+
+---
+
+## 5. Seguridad
+
+Cada BFF posee una configuración de seguridad independiente.
+
+La solución implementa:
+
+- HTTPS.
+- Certificados SSL/TLS.
+- Keystores PKCS12 independientes.
+- Autenticación mediante credenciales.
+- Tokens JWT.
+- Firma HMAC SHA-256.
+- Autorización específica por canal.
+- APIs sin estado mediante `STATELESS`.
+- Variables de entorno para contraseñas y secretos.
+
+Los permisos se diferencian mediante scopes:
+
+| Canal | Scope |
+|---|---|
+| Web | `WEB` |
+| Mobile | `MOBILE` |
+| ATM | `ATM` |
+
+Estos scopes se validan como:
 
 ```text
-Registros de entrada: 1000
-Registros procesados: 785
-Registros omitidos: 215
-Registros válidos: 387
-Registros con anomalías: 398
+SCOPE_WEB
+SCOPE_MOBILE
+SCOPE_ATM
 ```
 
-### Intereses mensuales
+Cada BFF expone:
 
 ```text
-Registros de entrada: 1000
-Registros omitidos: 363
-Cuentas consolidadas: 50
-Errores detectados en tasas: 0
-Errores detectados en intereses: 0
-Errores detectados en saldos finales: 0
+POST /auth/token
 ```
 
-### Estados de cuenta anuales
+para generar un JWT después de validar las credenciales.
+
+Posteriormente las solicitudes protegidas deben incluir:
 
 ```text
-Registros de entrada: 1000
-Registros procesados: 952
-Registros omitidos: 48
-Registros válidos: 329
-Registros con anomalías: 623
-Estados generados: 20
+Authorization: Bearer TOKEN_JWT
 ```
 
-## 7. Conclusión
+Una solicitud sin token o con un token inválido es rechazada con:
 
-La propuesta permite ejecutar los tres procesos requeridos mediante una arquitectura Spring Batch modular y tolerante a fallos.
+```text
+HTTP 401 Unauthorized
+```
 
-El uso de particiones y tres threads permitió mejorar el rendimiento manteniendo los resultados esperados. Además, la combinación de validaciones, políticas de omisión, listeners y reintentos permite continuar el procesamiento frente a registros incorrectos o fallos recuperables sin comprometer la ejecución completa del Job.
+Los certificados utilizados durante el desarrollo son autofirmados y destinados exclusivamente al entorno local.
+
+---
+
+## 6. Modularidad y escalabilidad
+
+La separación de los tres BFF permite modificar un canal sin alterar directamente los otros.
+
+Cada aplicación mantiene una estructura organizada mediante:
+
+```text
+config/
+controller/
+dto/
+service/
+```
+
+Esto permite:
+
+- incorporar nuevos endpoints;
+- modificar respuestas de un canal;
+- agregar nuevas reglas de autorización;
+- evolucionar cada BFF independientemente;
+- incorporar nuevos clientes en el futuro.
+
+Por ejemplo, un nuevo canal podría agregarse mediante un nuevo BFF sin modificar las respuestas existentes de Web, Mobile o ATM.
+
+---
+
+## 7. Ventajas de la propuesta
+
+La estrategia seleccionada entrega las siguientes ventajas:
+
+- Respuestas específicas para cada frontend.
+- Reducción de información innecesaria.
+- Separación de responsabilidades.
+- Seguridad diferenciada por canal.
+- Mejor mantenibilidad.
+- Escalabilidad independiente.
+- Menor acoplamiento entre los clientes y el backend principal.
+
+Como desventaja, mantener tres aplicaciones independientes aumenta la cantidad de configuraciones y componentes que deben administrarse.
+
+Sin embargo, para este proyecto la separación resulta adecuada debido a las diferencias existentes entre Web, Mobile y ATM.
+
+---
+
+## 8. Conclusión
+
+La propuesta implementa el patrón Backend for Frontend mediante tres backends independientes orientados a Web, Mobile y ATM.
+
+Cada BFF entrega información optimizada para su cliente y protege sus endpoints mediante HTTPS, certificados SSL/TLS, autenticación, autorización y tokens JWT.
+
+La solución conserva el acceso a datos en el backend principal y separa la lógica específica de cada frontend, obteniendo una arquitectura modular, segura y preparada para futuras extensiones.
