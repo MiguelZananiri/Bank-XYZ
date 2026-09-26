@@ -1,8 +1,10 @@
 package com.duoc.demo.Service;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -11,15 +13,19 @@ import org.springframework.web.server.ResponseStatusException;
 
 import com.duoc.demo.Dto.CuentaResponse;
 import com.duoc.demo.Dto.RetiroResponse;
+import com.duoc.demo.Messaging.TransaccionProducer;
 import com.duoc.demo.Repository.CuentaRepository;
+import com.duoc.events.TransaccionRealizadaEvent;
 
 @Service
 public class CuentaService {
 
     private final CuentaRepository cuentaRepository;
+    private final TransaccionProducer transaccionProducer;
 
-    public CuentaService(CuentaRepository cuentaRepository) {
+    public CuentaService(CuentaRepository cuentaRepository, TransaccionProducer transaccionProducer) {
         this.cuentaRepository = cuentaRepository;
+        this.transaccionProducer = transaccionProducer;
     }
 
     public List<CuentaResponse> obtenerTodas() {
@@ -87,6 +93,17 @@ public class CuentaService {
         CuentaResponse cuentaActualizada =
                 cuentaRepository.findById(cuentaId)
                         .orElseThrow();
+
+        TransaccionRealizadaEvent event =
+                new TransaccionRealizadaEvent(
+                        UUID.randomUUID(),
+                        LocalDateTime.now(),
+                        cuentaId.longValue(),
+                        monto,
+                        "RETIRO"
+                );
+
+        transaccionProducer.publicar(event);
 
         return new RetiroResponse(
                 cuentaId,
